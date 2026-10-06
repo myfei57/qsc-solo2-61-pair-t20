@@ -34,6 +34,8 @@ from tunnelnet.cable import (
     Cable,
     CableRegistry,
     MovingAverage,
+    SampleSeries,
+    cable_statistics,
     danger_count,
     healthy_count,
     load_factor,
@@ -580,18 +582,88 @@ class CableCase(unittest.TestCase):
         self.assertTrue(registry.sample("cable-1", 50.0))
         self.assertTrue(registry.sample("cable-1", 60.0))
         self.assertFalse(registry.sample("ghost", 10.0))
-        self.assertEqual(registry.history("cable-1"), [50.0, 60.0])
-        self.assertAlmostEqual(registry.average("cable-1"), 55.0)
-        self.assertEqual(registry.maximum("cable-1"), 60.0)
+        # set_temp goes through the same series, so history and current agree.
+        self.assertEqual(registry.history("cable-1"), [76.0, 50.0, 60.0])
+        self.assertAlmostEqual(registry.average("cable-1"), 62.0)
+        self.assertEqual(registry.maximum("cable-1"), 76.0)
         self.assertEqual(registry.minimum("cable-1"), 50.0)
-        self.assertEqual(registry.over("cable-1", 55.0), 1)
-        self.assertEqual(registry.sample_count(), 2)
-        self.assertEqual(registry.summary().as_dict(), {"total": 2, "samples": 2})
+        self.assertEqual(registry.over("cable-1", 55.0), 2)
+        self.assertEqual(registry.sample_count(), 3)
+        self.assertEqual(registry.summary().as_dict(), {"total": 2, "samples": 3})
         self.assertEqual(registry.temperatures(), [60.0, 80.0])
         self.assertEqual(danger_count(registry, 75.0), 1)
         self.assertEqual(healthy_count(registry, 75.0), 1)
         self.assertAlmostEqual(load_factor(registry), 70.0)
         self.assertIn("total=2", registry.describe())
+
+    def test_out_of_order_samples_sort_by_sample_time(self) -> None:
+        registry = CableRegistry()
+        registry.add(Cable(id="cable-1"))
+        registry.sample("cable-1", 70.0, "2026-01-01T00:02:00Z")
+        registry.sample("cable-1", 90.0, "2026-01-01T00:01:00Z")
+        registry.sample("cable-1", 80.0, "2026-01-01T00:03:00Z")
+        # Ordered by sample time, not arrival order.
+        self.assertEqual(registry.history("cable-1"), [90.0, 70.0, 80.0])
+        # Current state is the reading with the latest sample time.
+        state = registry.get("cable-1")
+        self.assertEqual(state.temp, 80.0)
+        self.assertEqual(state.status, "over")
+        self.assertEqual(registry.over("cable-1", 75.0), 2)
+        stats = cable_statistics(registry, "cable-1", 75.0)
+        self.assertEqual(stats.current, 80.0)
+        self.assertEqual(stats.over, 2)
+        self.assertEqual(stats.sample_count, 3)
+        self.assertEqual(stats.gap_policy, "skip")
+        self.assertEqual(stats.order_policy, "sample_time")
+
+    def test_series_round_trip_and_gap_policy(self) -> None:
+        series = SampleSeries()
+        series.record(50.0, "2026-01-01T00:02:00Z")
+        series.record(40.0, "2026-01-01T00:01:00Z")
+        restored = SampleSeries.from_dict(series.as_dict())
+        self.assertEqual(restored.values(), [40.0, 50.0])
+        self.assertEqual(restored.current().value, 50.0)
+        # A gap between 00:02 and 00:05 is skipped, not zero filled.
+        restored.record(80.0, "2026-01-01T00:05:00Z")
+        self.assertAlmostEqual(restored.average(), (40.0 + 50.0 + 80.0) / 3)
+        self.assertIsNone(SampleSeries.from_dict(None))
+        self.assertIsNone(SampleSeries.from_dict({"samples": [{"at": 1}]}))
+        self.assertIsNone(SampleSeries.from_dict({"samples": "nope"}))
+
+    def test_series_persisted_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            first = CableRegistry(store)
+            first.add(Cable(id="cable-1", cabin="cabin-1", temp=41.0))
+            first.sample("cable-1", 50.0, "2026-01-01T00:01:00Z")
+            first.sample("cable-1", 80.0, "2026-01-01T00:02:00Z")
+            persisted = store.load("cable-sample", "cable-1")
+            self.assertEqual([s["value"] for s in persisted["samples"]], [50.0, 80.0])
+            stats = store.load("cable-stats", "cable-1")
+            self.assertEqual(stats["over"], 1)
+            self.assertEqual(stats["current"], 80.0)
+
+            second = CableRegistry(store)
+            second.add(Cable(id="cable-1", cabin="cabin-1", temp=41.0))
+            self.assertEqual(second.history("cable-1"), [50.0, 80.0])
+            self.assertEqual(second.get("cable-1").temp, 80.0)
+            self.assertEqual(second.get("cable-1").status, "over")
+            self.assertEqual(second.sample_count(), 2)
+
+    def test_failed_persist_rejects_sample(self) -> None:
+        class FailingStore(Store):
+            def save(self, kind: str, record_id: str, value: object) -> None:
+                raise OSError("disk full")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CableRegistry(FailingStore.open(tmp))
+            registry.add(Cable(id="cable-1", temp=41.0))
+            with self.assertRaises(OSError):
+                registry.sample("cable-1", 90.0)
+            # The rejected sample never became visible to any statistic.
+            self.assertEqual(registry.history("cable-1"), [])
+            self.assertEqual(registry.get("cable-1").temp, 41.0)
+            self.assertEqual(registry.sample_count(), 0)
 
     def test_filter_and_status(self) -> None:
         moving = MovingAverage(2)

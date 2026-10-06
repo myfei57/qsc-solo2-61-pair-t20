@@ -28,7 +28,7 @@ class Runtime:
         self.cabins = CabinRegistry()
         self.partitions = PartitionTable()
         self.filter = MovingAverage(3)
-        self.cables = CableRegistry()
+        self.cables = CableRegistry(store)
         self.env = Environment(self.filter, self.partitions, DEFAULT_THRESHOLD)
         self.access = AccessService(store, self.cabins)
         self.pump = PumpUnit()

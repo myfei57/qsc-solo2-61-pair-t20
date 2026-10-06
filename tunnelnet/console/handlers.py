@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from tunnelnet.audit import between, events, filter_records, last, most_recent
 from tunnelnet.cabin import Cabin, status_summary
-from tunnelnet.cable import danger_count, healthy_count, load_factor
+from tunnelnet.cable import cable_statistics, danger_count, healthy_count, load_factor
 from tunnelnet.drain import Pit
 from tunnelnet.env import snapshot as env_snapshot
 from tunnelnet.fire import Detector
@@ -564,16 +564,11 @@ def cable_stats(server: "Server", request: Request) -> Response:
         raise RequestError(400, "id is required")
     threshold = request.query_field("threshold")
     limit = float(threshold) if threshold else 75.0
-    return json_response(
-        {
-            "id": cable_id,
-            "history": cables.history(cable_id),
-            "average": cables.average(cable_id),
-            "max": cables.maximum(cable_id),
-            "min": cables.minimum(cable_id),
-            "over": cables.over(cable_id, limit),
-        }
-    )
+    stats = cable_statistics(cables, cable_id, limit)
+    payload = stats.as_dict()
+    payload["id"] = cable_id
+    payload["history"] = cables.history(cable_id)
+    return json_response(payload)
 
 
 def cable_health(server: "Server", request: Request) -> Response:
@@ -592,6 +587,7 @@ def cable_temp(server: "Server", request: Request) -> Response:
     cable_id = request.str_field("cable_id")
     if not cables.set_temp(cable_id, request.float_field("temp")):
         raise RequestError(404, "cable not found")
+    record_event(server.runtime, "cable_stats", cable_id)
     state = cables.get(cable_id)
     return json_response({} if state is None else state.as_dict())
 
@@ -599,8 +595,9 @@ def cable_temp(server: "Server", request: Request) -> Response:
 def cable_sample(server: "Server", request: Request) -> Response:
     cables = server.runtime.cables
     cable_id = request.str_field("cable_id")
-    if not cables.sample(cable_id, request.float_field("value")):
+    if not cables.sample(cable_id, request.float_field("value"), request.str_field("at")):
         raise RequestError(404, "cable not found")
+    record_event(server.runtime, "cable_stats", cable_id)
     return json_response({"history": cables.history(cable_id)})
 
 

@@ -50,7 +50,10 @@ def seed_defaults(rt: Runtime) -> None:
     rt.quota.add_usage("cabin-2", 900.0)
     rt.drain.record_cycle("cabin-1", SEED_AT)
     rt.drain.record_cycle("cabin-1", SEED_AT)
-    rt.cables.sample("cable-1", 42.0)
-    rt.cables.sample("cable-1", 47.0)
+    if rt.cables.sample_count() == 0:
+        # Seed samples only when no persisted series was restored, so a
+        # restart never double-records them.
+        rt.cables.sample("cable-1", 42.0, SEED_AT)
+        rt.cables.sample("cable-1", 47.0, SEED_AT)
 
     rt.patrol.rebuild_route()

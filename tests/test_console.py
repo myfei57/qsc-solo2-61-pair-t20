@@ -49,7 +49,7 @@ class ConsoleCase(unittest.TestCase):
         status, health = self.call("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["kinds"], [])
+        self.assertEqual(health["kinds"], ["cable-sample", "cable-stats"])
 
         status, checks = self.call("GET", "/api/health/checks")
         self.assertEqual(status, 200)
@@ -443,6 +443,9 @@ class ConsoleCase(unittest.TestCase):
         self.assertAlmostEqual(stats["average"], 44.5)
         self.assertEqual(stats["max"], 47.0)
         self.assertEqual(stats["over"], 0)
+        self.assertEqual(stats["current"], 47.0)
+        self.assertEqual(stats["gap_policy"], "skip")
+        self.assertEqual(stats["order_policy"], "sample_time")
 
         status, body = self.call("GET", "/api/cables/stats")
         self.assertEqual(status, 400)
@@ -450,7 +453,7 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/api/cables/temp", {"cable_id": "cable-1", "temp": 80.0})
         self.assertEqual(body["status"], "over")
         status, body = self.call("POST", "/api/cables/sample", {"cable_id": "cable-1", "value": 90.0})
-        self.assertEqual(len(body["history"]), 3)
+        self.assertEqual(len(body["history"]), 4)
         status, body = self.call("POST", "/api/cables/temp", {"cable_id": "ghost", "temp": 10.0})
         self.assertEqual(status, 404)
         status, body = self.call("POST", "/api/cables/sample", {"cable_id": "ghost", "value": 10.0})
@@ -460,6 +463,52 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(health["danger"], 1)
         self.assertEqual(health["healthy"], 1)
         self.assertGreater(health["load_factor"], 0)
+
+    def test_cable_series_single_calibre(self) -> None:
+        # Out of order arrival: the later sample time wins the current state.
+        self.call(
+            "POST",
+            "/api/cables/sample",
+            {"cable_id": "cable-2", "value": 80.0, "at": "2026-02-01T00:02:00Z"},
+        )
+        self.call(
+            "POST",
+            "/api/cables/sample",
+            {"cable_id": "cable-2", "value": 60.0, "at": "2026-02-01T00:01:00Z"},
+        )
+        _, stats = self.call("GET", "/api/cables/stats", query={"id": ["cable-2"]})
+        self.assertEqual(stats["history"], [60.0, 80.0])
+        self.assertEqual(stats["current"], 80.0)
+        self.assertEqual(stats["status"], "over")
+        self.assertEqual(stats["over"], 1)
+
+        # The list view derives the same current state from the same series.
+        _, cables = self.call("GET", "/api/cables")
+        listed = {item["id"]: item for item in cables["items"]}
+        self.assertEqual(listed["cable-2"]["temp"], 80.0)
+        self.assertEqual(listed["cable-2"]["status"], "over")
+        _, health = self.call("GET", "/api/cables/health")
+        self.assertEqual(health["danger"], 1)
+
+        # Statistics are audited and persisted with the same calibre.
+        _, audit = self.call("GET", "/api/audit/query", query={"event": ["cable_stats"]})
+        self.assertGreaterEqual(len(audit["filtered"]), 2)
+        _, persisted = self.call("GET", "/api/store/export", query={"kind": ["cable-stats"]})
+        self.assertEqual(persisted["items"]["cable-2"]["over"], 1)
+        self.assertEqual(persisted["items"]["cable-2"]["current"], 80.0)
+        _, samples = self.call("GET", "/api/store/export", query={"kind": ["cable-sample"]})
+        stored = samples["items"]["cable-2"]["samples"]
+        self.assertEqual([item["value"] for item in stored], [60.0, 80.0])
+
+        # A fresh console on the same store replays the persisted series.
+        restarted = Server(self.store, web_dir="web")
+        response = restarted.dispatch("GET", "/api/cables/stats", query={"id": ["cable-2"]})
+        replayed = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(replayed["history"], [60.0, 80.0])
+        self.assertEqual(replayed["current"], 80.0)
+        response = restarted.dispatch("GET", "/api/cables/stats", query={"id": ["cable-1"]})
+        seeded = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(seeded["history"], [42.0, 47.0])
 
     def test_quota_routes(self) -> None:
         status, report = self.call("GET", "/api/quota/report")
