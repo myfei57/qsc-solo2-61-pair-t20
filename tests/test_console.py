@@ -436,30 +436,109 @@ class ConsoleCase(unittest.TestCase):
     def test_cable_routes(self) -> None:
         status, cables = self.call("GET", "/api/cables")
         self.assertEqual(len(cables["items"]), 2)
-        self.assertEqual(cables["summary"]["samples"], 2)
+        self.assertEqual(cables["summary"]["samples"], 3)
+        self.assertEqual(cables["run"]["policy"]["gap_policy"], "skip")
+        self.assertEqual(cables["run"]["policy"]["ordering"], "sample_time")
 
         status, stats = self.call("GET", "/api/cables/stats", query={"id": ["cable-1"]})
         self.assertEqual(stats["history"], [42.0, 47.0])
+        self.assertEqual(stats["current"], 47.0)
         self.assertAlmostEqual(stats["average"], 44.5)
         self.assertEqual(stats["max"], 47.0)
         self.assertEqual(stats["over"], 0)
+        self.assertEqual(stats["gaps"], 0)
 
         status, body = self.call("GET", "/api/cables/stats")
         self.assertEqual(status, 400)
 
+        # set_temp is an observation on the shared series.
         status, body = self.call("POST", "/api/cables/temp", {"cable_id": "cable-1", "temp": 80.0})
         self.assertEqual(body["status"], "over")
-        status, body = self.call("POST", "/api/cables/sample", {"cable_id": "cable-1", "value": 90.0})
-        self.assertEqual(len(body["history"]), 3)
+        status, body = self.call(
+            "POST", "/api/cables/sample", {"cable_id": "cable-1", "value": 90.0, "at": "2026-02-01"}
+        )
+        self.assertEqual(len(body["history"]), 4)
         status, body = self.call("POST", "/api/cables/temp", {"cable_id": "ghost", "temp": 10.0})
         self.assertEqual(status, 404)
         status, body = self.call("POST", "/api/cables/sample", {"cable_id": "ghost", "value": 10.0})
         self.assertEqual(status, 404)
 
+        # Recompute publishes one run, persists it and writes one audit record.
+        audit_before = self.server.runtime.audit.count()
+        status, run = self.call("POST", "/api/cables/recompute")
+        self.assertEqual(status, 200)
+        self.assertEqual(run["danger"], 1)
+        self.assertEqual(run["healthy"], 1)
+        self.assertEqual(self.server.runtime.audit.count(), audit_before + 1)
+        # The run itself is durable.
+        self.assertIn("cable-stats", self.store.kinds())
+
+        # The health endpoint and the dashboard reference that same run.
         status, health = self.call("GET", "/api/cables/health")
-        self.assertEqual(health["danger"], 1)
-        self.assertEqual(health["healthy"], 1)
+        self.assertEqual(health["danger"], run["danger"])
+        self.assertEqual(health["healthy"], run["healthy"])
         self.assertGreater(health["load_factor"], 0)
+        status, report = self.call("GET", "/api/report")
+        self.assertEqual(report["cables"]["danger"], run["danger"])
+        self.assertEqual(report["cables"]["run_id"], run["id"])
+
+        # CSV export cites the same run and over temperature count.
+        status, csv_body = self.call("GET", "/api/export/cables")
+        self.assertTrue(csv_body.startswith("cable_id,current,status"))
+        over_rows = [line for line in csv_body.splitlines() if line.endswith(",over")]
+        self.assertEqual(len(over_rows), run["danger"])
+
+    def test_cable_series_unified_and_recoverable(self) -> None:
+        # Out of order arrival is ordered by sample time.
+        self.call("POST", "/api/cables/sample", {"cable_id": "cable-1", "value": 90.0, "at": "t3"})
+        self.call("POST", "/api/cables/sample", {"cable_id": "cable-1", "value": 30.0, "at": "t1"})
+        status, stats = self.call("GET", "/api/cables/stats", query={"id": ["cable-1"]})
+        self.assertEqual(stats["history"], [42.0, 47.0, 30.0, 90.0])
+        self.assertEqual(stats["current"], 90.0)
+
+        # Offline gaps are recorded and skipped, never zero filled.
+        self.call("POST", "/api/cables/sample", {"cable_id": "cable-1", "quality": "gap", "at": "t4"})
+        status, stats = self.call("GET", "/api/cables/stats", query={"id": ["cable-1"]})
+        self.assertEqual(stats["gaps"], 1)
+        self.assertNotIn(0.0, stats["history"])
+
+        # Idempotent redelivery with a token.
+        status, first = self.call(
+            "POST", "/api/cables/sample", {"cable_id": "cable-2", "value": 77.0, "at": "g1", "token": "x"}
+        )
+        status, second = self.call(
+            "POST", "/api/cables/sample", {"cable_id": "cable-2", "value": 77.0, "at": "g2", "token": "x"}
+        )
+        self.assertEqual(status, 404)
+
+        # Batch ingest isolates partial failures for redrive.
+        status, body = self.call(
+            "POST",
+            "/api/cables/samples",
+            {
+                "samples": [
+                    {"cable_id": "cable-2", "value": 50.0, "at": "b1"},
+                    {"cable_id": "ghost", "value": 50.0, "at": "b2"},
+                ]
+            },
+        )
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(len(body["rejected"]), 1)
+
+        # Reboot: a new server over the same store replays the durable series.
+        # Journaled real observations survive; seed (demo) values are not
+        # journaled, so assert on the durable arrivals made above.
+        rebooted = Server(self.store, web_dir="web")
+        journal = rebooted.runtime.cable_telemetry._journal
+        replayed = sum(len(journal.load(cid)) for cid in journal.cable_ids())
+        self.assertGreaterEqual(replayed, 5)
+        history = [s.value for s in rebooted.runtime.cables.series("cable-1") if s.valid]
+        self.assertEqual(history[-1], 90.0)
+        # The gap is durable too and stays skipped by statistics.
+        gap_run = rebooted.runtime.cable_telemetry.latest()
+        cable_gaps = gap_run.for_cable("cable-1")
+        self.assertEqual(cable_gaps.gaps, 1)
+        self.assertEqual(cable_gaps.current, 90.0)
 
     def test_quota_routes(self) -> None:
         status, report = self.call("GET", "/api/quota/report")

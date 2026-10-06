@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tunnelnet.cable import danger_count
-
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from .runtime import Runtime
 
@@ -62,7 +60,7 @@ def run_checks(rt: "Runtime") -> list[dict[str, str]]:
         }
     )
 
-    danger = danger_count(rt.cables, 75.0)
+    danger = rt.cable_telemetry.latest().danger_count
     checks.append(
         {"name": "cables", "status": "warn" if danger else "ok", "detail": f"over temperature={danger}"}
     )

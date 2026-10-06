@@ -9,6 +9,7 @@ from tunnelnet.audit import AuditRegistry
 from tunnelnet.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
+    from tunnelnet.cable.stats import StatsRun
     from tunnelnet.console.telemetry import Telemetry
 
 QUOTE_TRIGGERS = (",", '"', "\n")
@@ -49,3 +50,40 @@ def telemetry_export(telemetry: Telemetry) -> tuple[list[str], list[list[object]
     """Columns and rows for the telemetry counters."""
 
     return ["metric", "value"], [[key, value] for key, value in telemetry.as_dict().items()]
+
+
+CABLE_STATS_COLUMNS = [
+    "cable_id",
+    "current",
+    "status",
+    "average",
+    "min",
+    "max",
+    "samples",
+    "gaps",
+    "over",
+]
+
+
+def cable_run_export(run: StatsRun) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows for a cable statistics run.
+
+    The rows come straight from the shared, audited run, so the CSV export and
+    the console report cannot disagree about the over temperature count.
+    """
+
+    rows = [
+        [
+            stats.cable_id,
+            "" if stats.current is None else stats.current,
+            stats.status,
+            f"{stats.average:.4f}",
+            stats.minimum,
+            stats.maximum,
+            stats.samples,
+            stats.gaps,
+            stats.over,
+        ]
+        for stats in run.cables
+    ]
+    return list(CABLE_STATS_COLUMNS), rows

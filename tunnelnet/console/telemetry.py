@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tunnelnet.cable import danger_count
-
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from .runtime import Runtime
 
@@ -68,12 +66,13 @@ class Telemetry:
 def collect(rt: "Runtime") -> Telemetry:
     """Read every counter without mutating the control state."""
 
+    cable_run = rt.cable_telemetry.latest()
     return Telemetry(
         namespaces=rt.namespaces.count(),
         cabins=rt.cabins.count(),
         active_cabins=rt.cabins.active_count(),
-        cables=rt.cables.count(),
-        cable_danger=danger_count(rt.cables, 75.0),
+        cables=cable_run.total_cables,
+        cable_danger=cable_run.danger_count,
         pits=rt.drain.pit_count(),
         high_pits=rt.drain.high_count(),
         cycles=rt.drain.cycle_count(),

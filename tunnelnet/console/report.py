@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tunnelnet.cable import danger_count, healthy_count, load_factor
 from tunnelnet.cabin import status_summary
 from tunnelnet.ns import Stage, control_chain
 
@@ -20,6 +19,7 @@ def text_report(rt: "Runtime") -> str:
 
     describe = collect_describe(rt)
     telemetry = collect_telemetry(rt)
+    cable_run = rt.cable_telemetry.latest()
     line = control_chain()
     rows = [
         "tunnelnet control report",
@@ -39,7 +39,10 @@ def text_report(rt: "Runtime") -> str:
         f"cables: {describe['cables']}",
         f"suppression: {describe['suppression']}",
         f"audit: {describe['audit']}",
-        f"cable danger={telemetry.cable_danger} load_factor={load_factor(rt.cables):.4f}",
+        (
+            f"cable run={cable_run.id} danger={cable_run.danger_count} "
+            f"load_factor={cable_run.load_factor:.4f} gap_policy={cable_run.gap_policy}"
+        ),
         f"drain pits={telemetry.pits} high={telemetry.high_pits} cycles={telemetry.cycles}",
         (
             f"patrol route={telemetry.patrol_route} checked={telemetry.patrol_checked} "
@@ -57,14 +60,22 @@ def dashboard(rt: "Runtime") -> dict[str, object]:
 
     fire_report = rt.fire.report()
     quota_report = rt.quota.report()
+    cable_run = rt.cable_telemetry.latest()
     return {
         "namespaces": {"count": rt.namespaces.count()},
         "cabins": status_summary(rt.cabins).as_dict(),
         "cables": {
-            "count": rt.cables.count(),
-            "load_factor": load_factor(rt.cables),
-            "danger": danger_count(rt.cables, 75.0),
-            "healthy": healthy_count(rt.cables, 75.0),
+            "run_id": cable_run.id,
+            "run_at": cable_run.at,
+            "policy": cable_run.policy(),
+            "count": cable_run.total_cables,
+            "samples": cable_run.sample_count,
+            "gaps": cable_run.gap_count,
+            "load_factor": cable_run.load_factor,
+            "danger": cable_run.danger_count,
+            "healthy": cable_run.healthy_count,
+            "unknown": cable_run.unknown_count,
+            "items": [stats.as_dict() for stats in cable_run.cables],
         },
         "drain": {
             "pits": rt.drain.pit_count(),

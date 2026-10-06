@@ -1,20 +1,39 @@
-"""Over temperature and load statistics for the cable registry."""
+"""Fleet wide over temperature and load statistics.
+
+The helpers here are thin projections of the per-cable statistics, never an
+independent calculation: each cable is classified from the same series that
+feeds its history window.  Console code reads the shared
+:class:`~tunnelnet.cable.stats.StatsRun` instead (``run.danger_count`` etc.).
+"""
 
 from __future__ import annotations
 
-from .registry import CableRegistry
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .registry import CableRegistry
 
 
-def danger_count(registry: CableRegistry, threshold: float) -> int:
-    return sum(1 for temp in registry.temperatures() if temp >= threshold)
+def danger_count(registry: "CableRegistry", threshold: float) -> int:
+    return sum(
+        1
+        for cable_id in registry.cable_ids()
+        if registry.stats(cable_id, threshold).status == "over"
+    )
 
 
-def healthy_count(registry: CableRegistry, threshold: float) -> int:
-    return sum(1 for temp in registry.temperatures() if temp < threshold)
+def healthy_count(registry: "CableRegistry", threshold: float) -> int:
+    return sum(
+        1
+        for cable_id in registry.cable_ids()
+        if registry.stats(cable_id, threshold).status == "normal"
+    )
 
 
-def load_factor(registry: CableRegistry) -> float:
-    temperatures = registry.temperatures()
-    if not temperatures:
-        return 0.0
-    return sum(temperatures) / len(temperatures)
+def load_factor(registry: "CableRegistry") -> float:
+    currents = [
+        current
+        for cable_id in registry.cable_ids()
+        if (current := registry.current(cable_id)) is not None
+    ]
+    return sum(currents) / len(currents) if currents else 0.0

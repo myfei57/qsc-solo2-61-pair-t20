@@ -12,7 +12,7 @@ from .metrics import Metrics
 from .pages import load_page, page_file, root_redirect
 from .routes import register_routes
 from .runtime import Runtime
-from .seed import seed_defaults
+from .seed import seed_observations, seed_topology
 
 
 class Server:
@@ -20,7 +20,11 @@ class Server:
 
     def __init__(self, store: Store, web_dir: str = "web") -> None:
         self.runtime = Runtime(store)
-        seed_defaults(self.runtime)
+        # Catalogue first so the durable series can always find its cables,
+        # replay the journal, then add the demo observations for fresh boots.
+        seed_topology(self.runtime)
+        self.runtime.cable_telemetry.recover()
+        seed_observations(self.runtime)
         self.web_dir = web_dir
         self.router = Router()
         self.metrics = Metrics()

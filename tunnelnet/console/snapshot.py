@@ -27,7 +27,10 @@ def collect(rt: "Runtime") -> dict[str, object]:
         "fire": rt.fire.report().as_dict(),
         "patrol": rt.patrol.state().as_dict(),
         "quota": rt.quota.report().as_dict(),
-        "cables": rt.cables.summary().as_dict(),
+        "cables": {
+            "summary": rt.cables.summary().as_dict(),
+            "run": rt.cable_telemetry.latest().as_dict(),
+        },
         "suppression": {"zones": rt.suppression.distinct_zones()},
         "audit": rt.audit.state().as_dict(),
     }

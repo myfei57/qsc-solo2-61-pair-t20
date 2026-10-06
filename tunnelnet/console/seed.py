@@ -10,10 +10,19 @@ from tunnelnet.fire import Detector
 from .runtime import Runtime
 
 SEED_AT = "2026-01-01T00:00:00Z"
+#: Deterministic seed sample times, ordered, so the shared series is reproducible.
+SEED_SAMPLE_AT = (
+    "2026-01-01T00:00:00.000001Z",
+    "2026-01-01T00:00:00.000002Z",
+)
 
 
-def seed_defaults(rt: Runtime) -> None:
-    """Make sure every component has a usable starting value."""
+def seed_topology(rt: Runtime) -> None:
+    """Register the catalogue every component needs.
+
+    Runs before journal recovery so replayed samples can always find their
+    cable.  Idempotent: registering the same catalogue twice changes nothing.
+    """
 
     rt.namespaces.add("segment-a", "segment A")
     rt.namespaces.add("segment-b", "segment B")
@@ -41,6 +50,12 @@ def seed_defaults(rt: Runtime) -> None:
     rt.cables.add(Cable(id="cable-1", cabin="cabin-1", temp=42.0))
     rt.cables.add(Cable(id="cable-2", cabin="cabin-2", temp=46.0))
 
+    rt.patrol.rebuild_route()
+
+
+def seed_observations(rt: Runtime) -> None:
+    """Record the demo observations on the shared sampling series."""
+
     rt.env.sample("sensor-1", 48.0, SEED_AT)
     rt.env.sample("sensor-1", 51.0, SEED_AT)
     rt.env.sample("sensor-2", 55.0, SEED_AT)
@@ -50,7 +65,14 @@ def seed_defaults(rt: Runtime) -> None:
     rt.quota.add_usage("cabin-2", 900.0)
     rt.drain.record_cycle("cabin-1", SEED_AT)
     rt.drain.record_cycle("cabin-1", SEED_AT)
-    rt.cables.sample("cable-1", 42.0)
-    rt.cables.sample("cable-1", 47.0)
+    rt.cable_telemetry.record_seed("cable-1", 42.0, at=SEED_SAMPLE_AT[0])
+    rt.cable_telemetry.record_seed("cable-1", 47.0, at=SEED_SAMPLE_AT[1])
+    rt.cable_telemetry.record_seed("cable-2", 46.0, at=SEED_SAMPLE_AT[1])
 
-    rt.patrol.rebuild_route()
+
+def seed_defaults(rt: Runtime) -> None:
+    """Boot sequence: catalogue, durable recovery, then fresh observations."""
+
+    seed_topology(rt)
+    rt.cable_telemetry.recover()
+    seed_observations(rt)

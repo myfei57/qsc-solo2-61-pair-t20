@@ -103,8 +103,12 @@ def route_table() -> list[Route]:
         Route("GET", "/api/cables", "cables and summary", "cables_list"),
         Route("GET", "/api/cables/stats", "cable temperature statistics", "cable_stats"),
         Route("GET", "/api/cables/health", "danger and healthy counts", "cable_health"),
-        Route("POST", "/api/cables/temp", "set a cable temperature", "cable_temp"),
-        Route("POST", "/api/cables/sample", "sample a cable temperature", "cable_sample"),
+        Route("GET", "/api/cables/run", "current shared statistics run", "cable_run"),
+        Route("POST", "/api/cables/recompute", "recompute, persist and audit statistics", "cable_recompute"),
+        Route("POST", "/api/cables/recover", "replay the durable sampling series", "cable_recover"),
+        Route("POST", "/api/cables/temp", "sample a cable temperature", "cable_temp"),
+        Route("POST", "/api/cables/sample", "sample one cable temperature or gap", "cable_sample"),
+        Route("POST", "/api/cables/samples", "sample many cables in one batch", "cable_samples_batch"),
         Route("GET", "/api/quota/report", "baseline allocation report", "quota_report"),
         Route("GET", "/api/quota/usage", "usage per cabin", "quota_usage"),
         Route("GET", "/api/quota/advanced", "overage and forecast", "quota_advanced"),
@@ -126,6 +130,7 @@ def route_table() -> list[Route]:
         Route("POST", "/api/simulate", "run deterministic simulation ticks", "simulate"),
         Route("GET", "/api/export/audit", "audit trail as CSV", "export_audit"),
         Route("GET", "/api/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
+        Route("GET", "/api/export/cables", "cable statistics run as CSV", "export_cables"),
         Route("GET", "/api/export/store", "store record counts as CSV", "export_store"),
     ]
 

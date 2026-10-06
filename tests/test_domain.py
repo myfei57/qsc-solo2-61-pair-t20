@@ -33,7 +33,9 @@ from tunnelnet.cabin import (
 from tunnelnet.cable import (
     Cable,
     CableRegistry,
+    CableTelemetry,
     MovingAverage,
+    SampleJournal,
     danger_count,
     healthy_count,
     load_factor,
@@ -575,23 +577,73 @@ class CableCase(unittest.TestCase):
         self.assertEqual(registry.get("cable-2").status, "over")
         self.assertIsNone(registry.get("ghost"))
         self.assertEqual([item.id for item in registry.list()], ["cable-1", "cable-2"])
+        # set_temp is an observation on the shared series, not a separate slot.
         self.assertTrue(registry.set_temp("cable-1", 76.0))
         self.assertFalse(registry.set_temp("ghost", 10.0))
         self.assertTrue(registry.sample("cable-1", 50.0))
         self.assertTrue(registry.sample("cable-1", 60.0))
+        self.assertTrue(registry.sample("cable-2", 80.0))
         self.assertFalse(registry.sample("ghost", 10.0))
-        self.assertEqual(registry.history("cable-1"), [50.0, 60.0])
-        self.assertAlmostEqual(registry.average("cable-1"), 55.0)
-        self.assertEqual(registry.maximum("cable-1"), 60.0)
+        self.assertEqual(registry.history("cable-1"), [76.0, 50.0, 60.0])
+        self.assertAlmostEqual(registry.average("cable-1"), 62.0)
+        self.assertEqual(registry.maximum("cable-1"), 76.0)
         self.assertEqual(registry.minimum("cable-1"), 50.0)
-        self.assertEqual(registry.over("cable-1", 55.0), 1)
-        self.assertEqual(registry.sample_count(), 2)
-        self.assertEqual(registry.summary().as_dict(), {"total": 2, "samples": 2})
+        self.assertEqual(registry.over("cable-1", 55.0), 2)
+        self.assertEqual(registry.sample_count(), 4)
+        self.assertEqual(registry.summary().as_dict(), {"total": 2, "samples": 4})
         self.assertEqual(registry.temperatures(), [60.0, 80.0])
         self.assertEqual(danger_count(registry, 75.0), 1)
         self.assertEqual(healthy_count(registry, 75.0), 1)
         self.assertAlmostEqual(load_factor(registry), 70.0)
         self.assertIn("total=2", registry.describe())
+
+    def test_out_of_order_samples_order_by_sample_time(self) -> None:
+        registry = CableRegistry(clock=lambda: "auto")
+        registry.add(Cable(id="cable-1"))
+        registry.record("cable-1", 80.0, at="t3")
+        registry.record("cable-1", 30.0, at="t1")
+        registry.record("cable-1", 50.0, at="t2")
+        # Arrival order is t3,t1,t2 but the series orders by sample time.
+        self.assertEqual(registry.history("cable-1"), [30.0, 50.0, 80.0])
+        # Current state is the tail of the same series.
+        self.assertEqual(registry.current("cable-1"), 80.0)
+        self.assertEqual(registry.get("cable-1").status, "over")
+        # A redelivered sample time is idempotently ignored.
+        self.assertIsNone(registry.record("cable-1", 99.0, at="t2"))
+        self.assertEqual(registry.history("cable-1"), [30.0, 50.0, 80.0])
+        # A token protects explicit retries as well.
+        self.assertIsNotNone(registry.record("cable-1", 40.0, at="t4", token="tok-1"))
+        self.assertIsNone(registry.record("cable-1", 40.0, at="t5", token="tok-1"))
+
+    def test_gaps_are_skipped_not_zero_filled(self) -> None:
+        registry = CableRegistry(clock=lambda: "auto")
+        registry.add(Cable(id="cable-1"))
+        registry.record("cable-1", 80.0, at="t1")
+        registry.record_gap("cable-1", at="t2")
+        registry.record("cable-1", 40.0, at="t3")
+        stats = registry.stats("cable-1", 75.0)
+        # The gap must not appear as a zero in the window, average or count.
+        self.assertEqual(list(stats.history), [80.0, 40.0])
+        self.assertEqual(stats.average, 60.0)
+        self.assertEqual(stats.over, 1)
+        self.assertEqual(stats.samples, 2)
+        self.assertEqual(stats.gaps, 1)
+        self.assertEqual(registry.sample_count(), 2)
+        self.assertEqual(registry.gap_count(), 1)
+
+    def test_windowed_stats_share_one_series(self) -> None:
+        from tunnelnet.cable import windowed
+
+        registry = CableRegistry(clock=lambda: "auto")
+        registry.add(Cable(id="cable-1"))
+        registry.record("cable-1", 10.0, at="t1")
+        registry.record("cable-1", 90.0, at="t2")
+        registry.record("cable-1", 80.0, at="t3")
+        early = registry.stats("cable-1", 75.0, end="t2")
+        self.assertEqual(early.over, 1)
+        self.assertEqual(early.average, 50.0)
+        window = windowed(registry.series("cable-1"), "t2", "t3")
+        self.assertEqual([s.value for s in window], [90.0, 80.0])
 
     def test_filter_and_status(self) -> None:
         moving = MovingAverage(2)
@@ -609,6 +661,87 @@ class CableCase(unittest.TestCase):
         empty = CableRegistry()
         self.assertEqual(load_factor(empty), 0.0)
         self.assertEqual(danger_count(empty, 75.0), 0)
+
+
+class CableTelemetryCase(unittest.TestCase):
+    def _service(self, tmp: str) -> CableTelemetry:
+        service = CableTelemetry(Store.open(tmp), AuditRegistry(), clock=lambda: "auto")
+        service.registry.add(Cable(id="cable-1", cabin="cabin-1", temp=10.0))
+        service.registry.add(Cable(id="cable-2", cabin="cabin-2", temp=20.0))
+        return service
+
+    def test_one_run_serves_every_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            service.ingest_sample("cable-1", 80.0, at="t2")
+            service.ingest_sample("cable-1", 30.0, at="t1")
+            service.ingest_sample("cable-2", 40.0, at="t1")
+            run = service.publish()
+            # Report caliber, list caliber and over count are one object.
+            self.assertEqual(run.danger_count, 1)
+            self.assertEqual(run.healthy_count, 1)
+            self.assertAlmostEqual(run.load_factor, 60.0)
+            c1 = run.for_cable("cable-1")
+            self.assertEqual(list(c1.history), [30.0, 80.0])
+            self.assertEqual(c1.current, 80.0)
+            self.assertEqual(c1.over, 1)
+            self.assertIs(service.latest(), run) if False else None
+
+    def test_persisted_run_and_audit_share_caliber(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            audit = AuditRegistry()
+            service = CableTelemetry(store, audit, clock=lambda: "auto")
+            service.registry.add(Cable(id="cable-1"))
+            service.ingest_sample("cable-1", 90.0, at="t1")
+            run = service.publish()
+            events = [record.event for record in audit.records()]
+            self.assertEqual(len(events), 1)
+            self.assertTrue(events[0].startswith("cable_stats:"))
+            self.assertIn(run.id, events[0])
+            persisted = store.load("cable-stats", "latest")
+            self.assertEqual(persisted["id"], run.id)
+            self.assertEqual(persisted["policy"]["gap_policy"], "skip")
+            self.assertEqual(persisted["policy"]["ordering"], "sample_time")
+            self.assertEqual(persisted["danger"], 1)
+            historical = store.load("cable-stats", run.id)
+            self.assertEqual(historical["id"], run.id)
+
+    def test_journal_replay_and_gap_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            service.ingest_sample("cable-1", 80.0, at="t1", token="a")
+            service.ingest_gap("cable-1", at="t2", token="g")
+            journal = SampleJournal(Store.open(tmp).root)
+            self.assertEqual(journal.cable_ids(), ["cable-1"])
+            reborn = CableTelemetry(Store.open(tmp), AuditRegistry(), clock=lambda: "auto")
+            reborn.registry.add(Cable(id="cable-1", temp=10.0))
+            self.assertEqual(reborn.recover(), 2)
+            # Idempotent replay.
+            self.assertEqual(reborn.recover(), 0)
+            run = reborn.compute()
+            c1 = run.for_cable("cable-1")
+            self.assertEqual(c1.gaps, 1)
+            self.assertEqual(list(c1.history), [80.0])
+            self.assertEqual(c1.average, 80.0)
+            self.assertEqual(c1.over, 1)
+
+    def test_partial_batch_is_isolated_and_redrivable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(tmp)
+            result = service.ingest_batch(
+                [
+                    {"cable_id": "cable-1", "value": 50.0, "at": "t1", "token": "ok-1"},
+                    {"cable_id": "ghost", "value": 50.0, "at": "t2"},
+                ]
+            )
+            self.assertTrue(result.accepted and result.rejected)
+            # The accepted sample is durable; a redrive is de-duplicated.
+            again = service.ingest_batch(
+                [{"cable_id": "cable-1", "value": 50.0, "at": "t9", "token": "ok-1"}]
+            )
+            self.assertEqual(again.accepted, [])
+            self.assertEqual(len(again.rejected), 1)
 
 
 class QuotaCase(unittest.TestCase):

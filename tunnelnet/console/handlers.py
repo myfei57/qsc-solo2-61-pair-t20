@@ -6,12 +6,11 @@ from typing import TYPE_CHECKING
 
 from tunnelnet.audit import between, events, filter_records, last, most_recent
 from tunnelnet.cabin import Cabin, status_summary
-from tunnelnet.cable import danger_count, healthy_count, load_factor
 from tunnelnet.drain import Pit
 from tunnelnet.env import snapshot as env_snapshot
 from tunnelnet.fire import Detector
 from tunnelnet.ns import Stage, control_chain
-from tunnelnet.reporting import audit_export, telemetry_export, to_csv
+from tunnelnet.reporting import audit_export, cable_run_export, telemetry_export, to_csv
 from tunnelnet.reporting import store_export as store_csv_export
 from tunnelnet.store import export_all, export_kind, list_approvals, revoke_approval, summarize
 
@@ -551,57 +550,125 @@ def patrol_due(server: "Server", request: Request) -> Response:
 
 
 def cables_list(server: "Server", request: Request) -> Response:
-    cables = server.runtime.cables
+    cables = server.runtime.cable_telemetry
+    run = cables.latest()
     return json_response(
-        {"items": [cable.as_dict() for cable in cables.list()], "summary": cables.summary().as_dict()}
+        {
+            "items": [cable.as_dict() for cable in cables.registry.list()],
+            "summary": cables.registry.summary().as_dict(),
+            "run": {"id": run.id, "at": run.at, "policy": run.policy()},
+        }
     )
 
 
 def cable_stats(server: "Server", request: Request) -> Response:
-    cables = server.runtime.cables
+    telemetry = server.runtime.cable_telemetry
     cable_id = request.query_field("id")
     if not cable_id:
         raise RequestError(400, "id is required")
-    threshold = request.query_field("threshold")
-    limit = float(threshold) if threshold else 75.0
+    if telemetry.registry.get(cable_id) is None:
+        raise RequestError(404, "cable not found")
+    start = request.query_field("start", "") or None
+    end = request.query_field("end", "") or None
+    stats = telemetry.cable_stats(cable_id, start, end)
     return json_response(
         {
-            "id": cable_id,
-            "history": cables.history(cable_id),
-            "average": cables.average(cable_id),
-            "max": cables.maximum(cable_id),
-            "min": cables.minimum(cable_id),
-            "over": cables.over(cable_id, limit),
+            "id": stats.cable_id,
+            "series": [sample.as_dict() for sample in telemetry.registry.series(cable_id)],
+            "history": list(stats.history),
+            "current": stats.current,
+            "status": stats.status,
+            "average": stats.average,
+            "max": stats.maximum,
+            "min": stats.minimum,
+            "over": stats.over,
+            "samples": stats.samples,
+            "gaps": stats.gaps,
         }
     )
 
 
 def cable_health(server: "Server", request: Request) -> Response:
-    cables = server.runtime.cables
+    run = server.runtime.cable_telemetry.latest()
     return json_response(
         {
-            "danger": danger_count(cables, 75.0),
-            "healthy": healthy_count(cables, 75.0),
-            "load_factor": load_factor(cables),
+            "run_id": run.id,
+            "policy": run.policy(),
+            "danger": run.danger_count,
+            "healthy": run.healthy_count,
+            "unknown": run.unknown_count,
+            "load_factor": run.load_factor,
+            "gaps": run.gap_count,
         }
     )
 
 
 def cable_temp(server: "Server", request: Request) -> Response:
-    cables = server.runtime.cables
+    telemetry = server.runtime.cable_telemetry
     cable_id = request.str_field("cable_id")
-    if not cables.set_temp(cable_id, request.float_field("temp")):
+    sample = telemetry.ingest_sample(
+        cable_id,
+        request.float_field("temp"),
+        at=request.str_field("at", "") or None,
+        token=request.str_field("token", ""),
+    )
+    if sample is None:
         raise RequestError(404, "cable not found")
-    state = cables.get(cable_id)
+    state = telemetry.registry.get(cable_id)
     return json_response({} if state is None else state.as_dict())
 
 
 def cable_sample(server: "Server", request: Request) -> Response:
-    cables = server.runtime.cables
+    telemetry = server.runtime.cable_telemetry
     cable_id = request.str_field("cable_id")
-    if not cables.sample(cable_id, request.float_field("value")):
-        raise RequestError(404, "cable not found")
-    return json_response({"history": cables.history(cable_id)})
+    at = request.str_field("at", "") or None
+    token = request.str_field("token", "") or None
+    quality = request.str_field("quality", "ok")
+    if quality == "gap":
+        sample = telemetry.ingest_gap(cable_id, at=at, token=token or "")
+    else:
+        sample = telemetry.ingest_sample(
+            cable_id, request.float_field("value"), at=at, token=token or ""
+        )
+    if sample is None:
+        raise RequestError(404, "cable not found or duplicate sample")
+    return json_response(
+        {
+            "sample": sample.as_dict(),
+            "history": telemetry.registry.history(cable_id),
+        }
+    )
+
+
+def cable_samples_batch(server: "Server", request: Request) -> Response:
+    raw = request.payload.get("samples")
+    if not isinstance(raw, list):
+        raise RequestError(400, "field samples must be a list")
+    result = server.runtime.cable_telemetry.ingest_batch(raw)
+    return json_response(result.as_dict())
+
+
+def cable_run(server: "Server", request: Request) -> Response:
+    telemetry = server.runtime.cable_telemetry
+    start = request.query_field("start", "") or None
+    end = request.query_field("end", "") or None
+    run = telemetry.compute(start, end, remember=False)
+    return json_response(run.as_dict())
+
+
+def cable_recompute(server: "Server", request: Request) -> Response:
+    """Recompute the shared run, persist it and append its audit record."""
+
+    telemetry = server.runtime.cable_telemetry
+    start = request.str_field("start", "") or None
+    end = request.str_field("end", "") or None
+    run = telemetry.publish(start, end)
+    return json_response(run.as_dict())
+
+
+def cable_recover(server: "Server", request: Request) -> Response:
+    restored = server.runtime.cable_telemetry.recover()
+    return json_response({"restored": restored})
 
 
 def quota_report(server: "Server", request: Request) -> Response:
@@ -768,6 +835,18 @@ def export_audit(server: "Server", request: Request) -> Response:
 
 def export_telemetry(server: "Server", request: Request) -> Response:
     columns, rows = telemetry_export(telemetry_module.collect(server.runtime))
+    return csv_response(to_csv(columns, rows))
+
+
+def export_cables(server: "Server", request: Request) -> Response:
+    """Export the shared cable statistics run as CSV.
+
+    The rows come from the same run the console and health check display, so
+    the exported over temperature count matches the on screen one.
+    """
+
+    run = server.runtime.cable_telemetry.latest()
+    columns, rows = cable_run_export(run)
     return csv_response(to_csv(columns, rows))
 
 

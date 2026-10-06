@@ -5,7 +5,7 @@ from __future__ import annotations
 from tunnelnet.access import AccessService
 from tunnelnet.audit import AuditRegistry, MarkSet
 from tunnelnet.cabin import PartitionTable, PowerBook, Registry as CabinRegistry, SuppressionLog
-from tunnelnet.cable import CableRegistry, MovingAverage
+from tunnelnet.cable import CableRegistry, CableTelemetry, MovingAverage
 from tunnelnet.drain import DrainService, PumpUnit
 from tunnelnet.env import Environment
 from tunnelnet.fire import FireService
@@ -28,7 +28,9 @@ class Runtime:
         self.cabins = CabinRegistry()
         self.partitions = PartitionTable()
         self.filter = MovingAverage(3)
-        self.cables = CableRegistry()
+        self.audit = AuditRegistry()
+        self.cable_telemetry = CableTelemetry(store, self.audit, DEFAULT_THRESHOLD)
+        self.cables: CableRegistry = self.cable_telemetry.registry
         self.env = Environment(self.filter, self.partitions, DEFAULT_THRESHOLD)
         self.access = AccessService(store, self.cabins)
         self.pump = PumpUnit()
@@ -40,4 +42,3 @@ class Runtime:
         self.patrol = PatrolService(self.cabins)
         self.power_book = PowerBook()
         self.quota = QuotaService(self.cabins, self.power_book)
-        self.audit = AuditRegistry()
